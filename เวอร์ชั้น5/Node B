@@ -1,0 +1,353 @@
+Node B
+
+#include <Arduino.h>
+#include <SPI.h>
+#include <LoRa.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <Preferences.h>
+#include <time.h>
+#include <sys/time.h>
+#include <vector>
+#include <esp_task_wdt.h>
+
+#define WDT_TIMEOUT 8
+
+#define SCK 5
+#define MISO 19
+#define MOSI 27
+#define SS 18
+#define RST 14
+#define DIO0 26
+#define BAND 923E6
+#define BAT_ADC_PIN 35
+
+#define OLED_SDA 21
+#define OLED_SCL 22
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+Preferences preferences;
+
+const char* DEFAULT_LOCATION_B = "7.0050,100.4700";
+String currentLocationB;
+
+int hbCounterB = 0;
+int relayedCount = 0;
+int lastRssi = 0;
+float lastSnr = 0.0;
+unsigned long lastHeartbeat = 0;
+unsigned long heartbeatInterval = 40000;
+bool oledReady = false;
+
+int oledPage = 0;
+unsigned long lastOledSwitch = 0;
+unsigned long lastOledRender = 0;
+
+std::vector<String> seenMsgIDs;
+bool isDuplicate(String msgId) {
+  for (const auto& id : seenMsgIDs) {
+    if (id == msgId) return true;
+  }
+  if (seenMsgIDs.size() >= 60) seenMsgIDs.erase(seenMsgIDs.begin());
+  seenMsgIDs.push_back(msgId);
+  return false;
+}
+
+std::vector<String> splitString(const String &str, char delim) {
+  std::vector<String> tokens;
+  int start = 0;
+  int end = str.indexOf(delim);
+  while (end != -1) {
+    tokens.push_back(str.substring(start, end));
+    start = end + 1;
+    end = str.indexOf(delim, start);
+  }
+  tokens.push_back(str.substring(start));
+  return tokens;
+}
+
+uint16_t calculateCRC16(const String &str) {
+  uint16_t crc = 0xFFFF;
+  for (size_t i = 0; i < str.length(); i++) {
+    crc ^= (uint8_t)str[i];
+    for (uint8_t j = 0; j < 8; j++) {
+      if (crc & 0x0001) crc = (crc >> 1) ^ 0xA001;
+      else crc >>= 1;
+    }
+  }
+  return crc;
+}
+
+void setupWatchdog() {
+#if defined(ESP_IDF_VERSION_MAJOR) && ESP_IDF_VERSION_MAJOR >= 5
+  esp_task_wdt_config_t twdt_config = {
+    .timeout_ms = WDT_TIMEOUT * 1000,
+    .idle_core_mask = (1 << portNUM_PROCESSORS) - 1,
+    .trigger_panic = true
+  };
+  esp_task_wdt_reconfigure(&twdt_config);
+  esp_task_wdt_add(NULL);
+#else
+  esp_task_wdt_init(WDT_TIMEOUT, true);
+  esp_task_wdt_add(NULL);
+#endif
+}
+
+void performReboot() {
+  if (oledReady) {
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setTextColor(SSD1306_WHITE);
+    display.setCursor(15, 25);
+    display.println("REBOOTING NODE B...");
+    display.display();
+  }
+  LoRa.sleep();
+  delay(200);
+  esp_task_wdt_delete(NULL);
+  esp_restart();
+  while (true) { yield(); }
+}
+
+void syncTimeFromEpoch(unsigned long epoch) {
+  if (epoch > 1700000000) {
+    struct timeval tv = { (time_t)epoch, 0 };
+    settimeofday(&tv, NULL);
+    setenv("TZ", "ICT-7", 1);
+    tzset();
+  }
+}
+
+void loadLocationConfig() {
+  preferences.begin("node_cfg", true);
+  currentLocationB = preferences.getString("gps_loc", DEFAULT_LOCATION_B);
+  preferences.end();
+}
+
+void saveLocationConfig(String newLoc) {
+  newLoc.trim();
+  if (newLoc.length() > 0) {
+    currentLocationB = newLoc;
+    preferences.begin("node_cfg", false);
+    preferences.putString("gps_loc", newLoc);
+    preferences.end();
+  }
+}
+
+void configureLoRaRadio() {
+  LoRa.setTxPower(20);            
+  LoRa.setSpreadingFactor(9);     
+  LoRa.setSignalBandwidth(125E3); 
+  LoRa.setCodingRate4(5);         
+  LoRa.setPreambleLength(12);     
+  LoRa.setGain(0);                
+}
+
+void sendLoRaRaw(const String &packet) {
+  uint16_t crc = calculateCRC16(packet);
+  String finalPacket = packet + "|" + String(crc, HEX);
+  
+  LoRa.beginPacket();
+  LoRa.print(finalPacket);
+  LoRa.endPacket();
+}
+
+float getAccurateBatteryVoltage() {
+  uint32_t rawSum = 0;
+  for (int i = 0; i < 16; i++) {
+    rawSum += analogRead(BAT_ADC_PIN);
+    delayMicroseconds(100);
+  }
+  float rawAvg = rawSum / 16.0;
+  float volts = (rawAvg / 4095.0) * 2.0 * 3.3 * 1.08;
+  if (volts > 4.25) volts = 4.25;
+  if (volts < 3.00) volts = 3.00;
+  return volts;
+}
+
+int calculateBatteryPercentage(float volts) {
+  if (volts >= 4.15) return 100;
+  if (volts >= 4.00) return 90;
+  if (volts >= 3.85) return 75;
+  if (volts >= 3.75) return 50;
+  if (volts >= 3.65) return 30;
+  if (volts >= 3.50) return 15;
+  if (volts >= 3.30) return 5;
+  return 0;
+}
+
+String getFormattedTime() {
+  time_t now;
+  time(&now);
+  struct tm timeinfo;
+  localtime_r(&now, &timeinfo);
+  if (timeinfo.tm_year < 120) return "00:00:00";
+  char buf[20];
+  strftime(buf, sizeof(buf), "%H:%M:%S", &timeinfo);
+  return String(buf);
+}
+
+String getFormattedDate() {
+  time_t now;
+  time(&now);
+  struct tm timeinfo;
+  localtime_r(&now, &timeinfo);
+  if (timeinfo.tm_year < 120) return "--/--/----";
+  char buf[20];
+  strftime(buf, sizeof(buf), "%d/%m/%Y", &timeinfo);
+  return String(buf);
+}
+
+String getFormattedUptime() {
+  unsigned long sec = millis() / 1000;
+  int d = sec / 86400;
+  int h = (sec % 86400) / 3600;
+  int m = (sec % 3600) / 60;
+  int s = sec % 60;
+  char buf[30];
+  if (d > 0) snprintf(buf, sizeof(buf), "%dd %02dh %02dm %02ds", d, h, m, s);
+  else snprintf(buf, sizeof(buf), "%02dh %02dm %02ds", h, m, s);
+  return String(buf);
+}
+
+void updateOLED() {
+  if (!oledReady) return;
+  display.clearDisplay();
+  display.fillRect(0, 0, 128, 14, SSD1306_WHITE);
+  display.setTextColor(SSD1306_BLACK);
+  display.setTextSize(1);
+  display.setCursor(4, 3);
+  display.print(oledPage == 0 ? "NODE B: SYSTEM DASH" : "NODE B: MESH REPEAT");
+  display.setTextColor(SSD1306_WHITE);
+  display.drawFastHLine(0, 14, 128, SSD1306_WHITE);
+
+  float v = getAccurateBatteryVoltage();
+  int pct = calculateBatteryPercentage(v);
+
+  if (oledPage == 0) {
+    display.setCursor(0, 17); display.print("DATE: "); display.print(getFormattedDate());
+    display.setTextSize(2); display.setCursor(16, 27); display.print(getFormattedTime());
+    display.drawFastHLine(0, 44, 128, SSD1306_WHITE);
+    display.setTextSize(1); display.setCursor(0, 47); display.print("UP  : "); display.print(getFormattedUptime());
+    display.setCursor(0, 56); display.printf("BAT : %3d%% (%.2fV)", pct, v);
+  } else {
+    display.setCursor(0, 18); display.printf("Relayed: %d pkts", relayedCount);
+    display.setCursor(0, 28); display.printf("RSSI   : %d dBm", lastRssi);
+    display.setCursor(0, 38); display.printf("Battery: %d%% (%.2fV)", pct, v);
+    display.drawFastHLine(0, 48, 128, SSD1306_WHITE);
+    display.setCursor(0, 52); display.print("Status : ACTIVE REPEAT");
+  }
+  display.display();
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+
+  setenv("TZ", "ICT-7", 1);
+  tzset();
+
+  setupWatchdog();
+  loadLocationConfig();
+
+  Serial.println("\n--- STARTING NODE B (REPEATER) ---");
+
+  pinMode(BAT_ADC_PIN, INPUT);
+  Wire.begin(OLED_SDA, OLED_SCL);
+  if (display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    oledReady = true;
+    updateOLED();
+  }
+
+  SPI.begin(SCK, MISO, MOSI, SS);
+  LoRa.setPins(SS, RST, DIO0);
+  while (!LoRa.begin(BAND)) {
+    Serial.println("LoRa Init Failed! Retrying...");
+    delay(1000);
+    yield();
+  }
+
+  configureLoRaRadio();
+}
+
+void loop() {
+  esp_task_wdt_reset();
+
+  if (millis() - lastOledSwitch > 15000) {
+    lastOledSwitch = millis();
+    oledPage = (oledPage + 1) % 2;
+  }
+  
+  if (millis() - lastOledRender > 1000) {
+    lastOledRender = millis();
+    updateOLED();
+  }
+
+  // Heartbeat Node B
+  if (millis() - lastHeartbeat > heartbeatInterval) {
+    lastHeartbeat = millis();
+    heartbeatInterval = 40000 + random(0, 5000);
+    hbCounterB++;
+
+    float v = getAccurateBatteryVoltage();
+    int pct = calculateBatteryPercentage(v);
+    uint32_t freeHeap = ESP.getFreeHeap();
+    uint32_t uptimeSec = millis() / 1000;
+    unsigned long currentEpoch = (unsigned long)time(NULL);
+
+    String hbPacket = "HBB" + String(hbCounterB) + "|3|B|ALL|HB|Repeater|" + currentLocationB + "|" + String(pct) + "|" + String(v, 2) + "|" + String(freeHeap) + "|" + String(uptimeSec) + "|" + String(relayedCount) + "|" + String(currentEpoch);
+    sendLoRaRaw(hbPacket);
+  }
+
+  int packetSize = LoRa.parsePacket();
+  if (packetSize) {
+    String rawIncoming = "";
+    while (LoRa.available()) rawIncoming += (char)LoRa.read();
+    rawIncoming.trim();
+    lastRssi = LoRa.packetRssi();
+    lastSnr = LoRa.packetSnr();
+
+    int pLast = rawIncoming.lastIndexOf('|');
+    if (pLast == -1) return;
+    String payload = rawIncoming.substring(0, pLast);
+    uint16_t rxCrc = (uint16_t)strtol(rawIncoming.substring(pLast + 1).c_str(), NULL, 16);
+    if (calculateCRC16(payload) != rxCrc) return;
+
+    std::vector<String> tokens = splitString(payload, '|');
+    if (tokens.size() < 5) return;
+
+    String msgId = tokens[0];
+    int ttl = tokens[1].toInt();
+    String targetNode = tokens[3];
+    String msgType = tokens[4];
+
+    // ซิงค์เวลาไร้สายหากพบ Timestamp ในแพ็กเกจ Heartbeat จาก A หรือ C
+    if (msgType == "HB" && tokens.size() >= 13) {
+      unsigned long rxEpoch = strtoul(tokens[12].c_str(), NULL, 10);
+      syncTimeFromEpoch(rxEpoch);
+    }
+
+    if (isDuplicate(msgId)) return;
+
+    // คำสั่งรีสตาร์ท
+    if (msgType == "CMD" && (targetNode == "B" || targetNode == "ALL")) {
+      if (tokens.size() >= 6 && tokens[5] == "REBOOT") performReboot();
+    }
+
+    // ทวนสัญญาณ Mesh ต่อเมื่อ TTL > 1
+    if (ttl > 1) {
+      delay(random(30, 70));
+      
+      String relayedPayload = tokens[0] + "|" + String(ttl - 1);
+      for (size_t i = 2; i < tokens.size(); i++) {
+        relayedPayload += "|" + tokens[i];
+      }
+      
+      sendLoRaRaw(relayedPayload);
+      relayedCount++;
+    }
+  }
+}
