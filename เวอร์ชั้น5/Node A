@@ -1,0 +1,840 @@
+Node A
+
+#include <Arduino.h>
+#include <WiFi.h>
+#include <SPI.h>
+#include <LoRa.h>
+#include <ESPAsyncWebServer.h>
+#include <DNSServer.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <Preferences.h>
+#include <mbedtls/base64.h>
+#include <time.h>
+#include <sys/time.h>
+#include <queue>
+#include <vector>
+#include <mutex>
+#include <esp_task_wdt.h>
+
+#define WDT_TIMEOUT 8
+
+#define SCK 5
+#define MISO 19
+#define MOSI 27
+#define SS 18
+#define RST 14
+#define DIO0 26
+#define BAND 923E6
+#define BAT_ADC_PIN 35
+
+#define OLED_SDA 21
+#define OLED_SCL 22
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+Preferences preferences;
+
+const char* DEFAULT_LOCATION_A = "7.0081,100.4742";
+String currentLocationA;
+
+AsyncWebServer server(80);
+DNSServer dnsServer;
+const byte DNS_PORT = 53;
+
+int msgCounter = 0;
+int hbCounterA = 0;
+unsigned long lastHeartbeatTime = 0;
+unsigned long heartbeatInterval = 35000; 
+
+int oledPage = 0;
+unsigned long lastOledSwitch = 0;
+unsigned long lastOledRender = 0;
+bool oledReady = false;
+
+std::queue<String> txQueue;
+std::mutex txMutex;
+
+struct RetryMessage {
+  String msgId;
+  String fullPacket;
+  int retriesLeft;
+  unsigned long lastSentTime;
+};
+std::vector<RetryMessage> pendingRetryMsgs;
+std::mutex retryMutex;
+
+struct PendingReply {
+  String targetUid;
+  String officer;
+  String text;
+};
+std::vector<PendingReply> pendingReplies;
+
+struct MsgStatusUpdate {
+  String msgId;
+  String status;
+  String officer;
+};
+std::vector<MsgStatusUpdate> pendingStatusUpdates;
+std::mutex dataMutex;
+
+std::vector<String> seenMsgIDs;
+bool isDuplicate(String msgId) {
+  for (const auto& id : seenMsgIDs) {
+    if (id == msgId) return true;
+  }
+  if (seenMsgIDs.size() >= 50) seenMsgIDs.erase(seenMsgIDs.begin());
+  seenMsgIDs.push_back(msgId);
+  return false;
+}
+
+struct NodeStatus {
+  int rssi = 0;
+  float snr = 0.0;
+  unsigned long lastSeen = 0;
+  bool active = false;
+};
+NodeStatus nodeB, nodeC;
+int lastRssi = 0;
+float lastSnr = 0.0;
+
+std::vector<String> splitString(const String &str, char delim) {
+  std::vector<String> tokens;
+  int start = 0;
+  int end = str.indexOf(delim);
+  while (end != -1) {
+    tokens.push_back(str.substring(start, end));
+    start = end + 1;
+    end = str.indexOf(delim, start);
+  }
+  tokens.push_back(str.substring(start));
+  return tokens;
+}
+
+String encodeBase64(const String &input) {
+  unsigned char out[350];
+  size_t olen = 0;
+  mbedtls_base64_encode(out, sizeof(out), &olen, (const unsigned char*)input.c_str(), input.length());
+  out[olen] = '\0';
+  return String((char*)out);
+}
+
+String decodeBase64(const String &input) {
+  unsigned char out[350];
+  size_t olen = 0;
+  mbedtls_base64_decode(out, sizeof(out), &olen, (const unsigned char*)input.c_str(), input.length());
+  out[olen] = '\0';
+  return String((char*)out);
+}
+
+uint16_t calculateCRC16(const String &str) {
+  uint16_t crc = 0xFFFF;
+  for (size_t i = 0; i < str.length(); i++) {
+    crc ^= (uint8_t)str[i];
+    for (uint8_t j = 0; j < 8; j++) {
+      if (crc & 0x0001) crc = (crc >> 1) ^ 0xA001;
+      else crc >>= 1;
+    }
+  }
+  return crc;
+}
+
+void setupWatchdog() {
+#if defined(ESP_IDF_VERSION_MAJOR) && ESP_IDF_VERSION_MAJOR >= 5
+  esp_task_wdt_config_t twdt_config = {
+    .timeout_ms = WDT_TIMEOUT * 1000,
+    .idle_core_mask = (1 << portNUM_PROCESSORS) - 1,
+    .trigger_panic = true
+  };
+  esp_task_wdt_reconfigure(&twdt_config);
+  esp_task_wdt_add(NULL);
+#else
+  esp_task_wdt_init(WDT_TIMEOUT, true);
+  esp_task_wdt_add(NULL);
+#endif
+}
+
+void performReboot() {
+  if (oledReady) {
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setTextColor(SSD1306_WHITE);
+    display.setCursor(15, 25);
+    display.println("REBOOTING NODE A...");
+    display.display();
+  }
+  LoRa.sleep();
+  delay(200);
+  esp_task_wdt_delete(NULL);
+  esp_restart();
+  while (true) { yield(); }
+}
+
+void loadNodeConfig() {
+  preferences.begin("node_cfg", true);
+  currentLocationA = preferences.getString("gps_loc", DEFAULT_LOCATION_A);
+  msgCounter = preferences.getInt("msg_cnt", 0);
+  preferences.end();
+}
+
+void saveLocationConfig(String newLoc) {
+  newLoc.trim();
+  if (newLoc.length() > 0) {
+    currentLocationA = newLoc;
+    preferences.begin("node_cfg", false);
+    preferences.putString("gps_loc", newLoc);
+    preferences.end();
+  }
+}
+
+void saveMsgCounterConfig() {
+  preferences.begin("node_cfg", false);
+  preferences.putInt("msg_cnt", msgCounter);
+  preferences.end();
+}
+
+void configureLoRaRadio() {
+  LoRa.setTxPower(20);            
+  LoRa.setSpreadingFactor(9);     
+  LoRa.setSignalBandwidth(125E3); 
+  LoRa.setCodingRate4(5);         
+  LoRa.setPreambleLength(12);     
+  LoRa.setGain(0);                
+}
+
+void sendLoRaRaw(const String &packet) {
+  uint16_t crc = calculateCRC16(packet);
+  String finalPacket = packet + "|" + String(crc, HEX);
+  
+  LoRa.beginPacket();
+  LoRa.print(finalPacket);
+  LoRa.endPacket();
+}
+
+float getAccurateBatteryVoltage() {
+  uint32_t rawSum = 0;
+  for (int i = 0; i < 16; i++) {
+    rawSum += analogRead(BAT_ADC_PIN);
+    delayMicroseconds(100);
+  }
+  float rawAvg = rawSum / 16.0;
+  float volts = (rawAvg / 4095.0) * 2.0 * 3.3 * 1.08;
+  if (volts > 4.25) volts = 4.25;
+  if (volts < 3.00) volts = 3.00;
+  return volts;
+}
+
+int calculateBatteryPercentage(float volts) {
+  if (volts >= 4.15) return 100;
+  if (volts >= 4.00) return 90;
+  if (volts >= 3.85) return 75;
+  if (volts >= 3.75) return 50;
+  if (volts >= 3.65) return 30;
+  if (volts >= 3.50) return 15;
+  if (volts >= 3.30) return 5;
+  return 0;
+}
+
+void syncTimeFromEpoch(unsigned long epoch) {
+  if (epoch > 1700000000) {
+    struct timeval tv = { (time_t)epoch, 0 };
+    settimeofday(&tv, NULL);
+    setenv("TZ", "ICT-7", 1);
+    tzset();
+  }
+}
+
+String getFormattedTime() {
+  time_t now;
+  time(&now);
+  struct tm timeinfo;
+  localtime_r(&now, &timeinfo);
+  if (timeinfo.tm_year < 120) return "00:00:00";
+  char buf[20];
+  strftime(buf, sizeof(buf), "%H:%M:%S", &timeinfo);
+  return String(buf);
+}
+
+String getFormattedDate() {
+  time_t now;
+  time(&now);
+  struct tm timeinfo;
+  localtime_r(&now, &timeinfo);
+  if (timeinfo.tm_year < 120) return "--/--/----";
+  char buf[20];
+  strftime(buf, sizeof(buf), "%d/%m/%Y", &timeinfo);
+  return String(buf);
+}
+
+String getFormattedUptime() {
+  unsigned long sec = millis() / 1000;
+  int d = sec / 86400;
+  int h = (sec % 86400) / 3600;
+  int m = (sec % 3600) / 60;
+  int s = sec % 60;
+  char buf[30];
+  if (d > 0) snprintf(buf, sizeof(buf), "%dd %02dh %02dm %02ds", d, h, m, s);
+  else snprintf(buf, sizeof(buf), "%02dh %02dm %02ds", h, m, s);
+  return String(buf);
+}
+
+void initOLED() {
+  Wire.begin(OLED_SDA, OLED_SCL);
+  Wire.setTimeOut(1000);
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    oledReady = false;
+  } else {
+    oledReady = true;
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setTextColor(SSD1306_WHITE);
+    display.setCursor(10, 20);
+    display.println("BOOTING NODE A...");
+    display.display();
+  }
+}
+
+void updateOLED() {
+  if (!oledReady) return;
+  display.clearDisplay();
+  display.fillRect(0, 0, 128, 14, SSD1306_WHITE);
+  display.setTextColor(SSD1306_BLACK);
+  display.setTextSize(1);
+  display.setCursor(4, 3);
+  display.print(oledPage == 0 ? "NODE A: SYSTEM DASH" : "NODE A: NETWORK AP");
+  display.setTextColor(SSD1306_WHITE);
+  display.drawFastHLine(0, 14, 128, SSD1306_WHITE);
+
+  float v = getAccurateBatteryVoltage();
+  int pct = calculateBatteryPercentage(v);
+  unsigned long now = millis();
+  bool activeB = (now - nodeB.lastSeen < 60000) && nodeB.active;
+  bool activeC = (now - nodeC.lastSeen < 60000) && nodeC.active;
+
+  if (oledPage == 0) {
+    display.setCursor(0, 17); display.print("DATE: "); display.print(getFormattedDate());
+    display.setTextSize(2); display.setCursor(16, 27); display.print(getFormattedTime());
+    display.drawFastHLine(0, 44, 128, SSD1306_WHITE);
+    display.setTextSize(1); display.setCursor(0, 47); display.print("UP  : "); display.print(getFormattedUptime());
+    display.setCursor(0, 56); display.printf("BAT : %3d%% (%.2fV)", pct, v);
+  } else {
+    display.setCursor(0, 17); display.print("SSID: Emergency_Help");
+    display.setCursor(0, 27); display.print("IP  : 192.168.4.1");
+    display.setCursor(0, 37); display.printf("Sent: %d | RSSI:%ddBm", msgCounter, lastRssi);
+    display.drawFastHLine(0, 46, 128, SSD1306_WHITE);
+    display.setCursor(0, 49); display.print("Node B: "); display.print(activeB ? "ONLINE" : "OFFLINE");
+    display.setCursor(0, 57); display.print("Node C: "); display.print(activeC ? "ONLINE" : "OFFLINE");
+  }
+  display.display();
+}
+
+const char index_html[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html lang="th">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>SOS Emergency Chat</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+        body { background-color: #090d16; color: #f8fafc; display: flex; justify-content: center; align-items: center; min-height: 100vh; padding: 8px; }
+        .app-card { width: 100%; max-width: 440px; height: 95vh; background: #131c2e; border-radius: 20px; display: flex; flex-direction: column; overflow: hidden; box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.6); border: 1px solid #1e293b; }
+        .header { background: linear-gradient(135deg, #b91c1c, #7f1d1d); color: white; padding: 12px 14px; text-align: center; }
+        .header h2 { font-size: 1.05rem; font-weight: 700; }
+        .header .loc-badge { font-size: 0.72rem; background: rgba(0,0,0,0.3); padding: 4px 10px; border-radius: 12px; display: inline-flex; align-items: center; gap: 6px; margin-top: 4px; border: 1px solid rgba(255,255,255,0.15); cursor: pointer; }
+        .status-bar { background: #0b1120; padding: 8px 12px; border-bottom: 1px solid #1e293b; display: grid; grid-template-columns: 1fr 1fr; gap: 6px; font-size: 0.72rem; color: #94a3b8; }
+        .status-item { background: #182238; padding: 6px 8px; border-radius: 8px; border: 1px solid #243352; display: flex; align-items: center; justify-content: space-between; }
+        .status-value { font-weight: bold; color: #38bdf8; }
+        .node-list { grid-column: span 2; background: #182238; padding: 6px 8px; border-radius: 8px; border: 1px solid #243352; display: flex; justify-content: space-between; align-items: center; }
+        .node-tag { padding: 2px 6px; border-radius: 4px; font-weight: bold; font-size: 0.68rem; }
+        .node-online { background: #065f46; color: #34d399; }
+        .node-offline { background: #374151; color: #9ca3af; }
+        .user-bar { padding: 10px 14px; background: #0e1726; border-bottom: 1px solid #1e293b; display: flex; flex-direction: column; gap: 6px; }
+        .user-bar label { font-size: 0.7rem; color: #64748b; font-weight: 700; text-transform: uppercase; display: flex; justify-content: space-between; }
+        .user-bar input { width: 100%; padding: 8px 12px; border-radius: 8px; border: 1px solid #243352; background: #131c2e; color: #f8fafc; font-size: 0.85rem; outline: none; }
+        .btn-reboot { background: #7f1d1d; color: #fca5a5; border: 1px solid #dc2626; padding: 4px 10px; border-radius: 6px; font-size: 0.72rem; font-weight: bold; cursor: pointer; }
+        .chat-box { flex: 1; padding: 14px; overflow-y: auto; display: flex; flex-direction: column; gap: 10px; background: #070a12; }
+        .msg { max-width: 85%; padding: 10px 12px; border-radius: 14px; font-size: 0.88rem; line-height: 1.35; word-wrap: break-word; position: relative; }
+        .msg-user { background: #dc2626; color: white; align-self: flex-end; border-bottom-right-radius: 2px; }
+        .msg-officer { background: #1e293b; color: #f8fafc; align-self: flex-start; border-bottom-left-radius: 2px; border: 1px solid #334155; }
+        .msg-sender { font-size: 0.68rem; font-weight: bold; margin-bottom: 3px; color: #cbd5e1; }
+        .msg-footer { display: flex; justify-content: space-between; align-items: center; font-size: 0.65rem; margin-top: 4px; opacity: 0.9; }
+        .msg-status-tag { padding: 1px 5px; border-radius: 4px; font-size: 0.62rem; font-weight: bold; display: inline-block; }
+        .st-sent { background: rgba(255,255,255,0.2); color: #fff; }
+        .st-delivered { background: #0284c7; color: #fff; }
+        .st-claimed { background: #eab308; color: #000; }
+        .st-resolved { background: #10b981; color: #fff; }
+        .system-info { text-align: center; font-size: 0.72rem; color: #475569; margin: 4px 0; }
+        .input-bar-container { background: #131c2e; border-top: 1px solid #1e293b; padding: 10px 12px; }
+        .char-counter { font-size: 0.68rem; color: #64748b; text-align: right; margin-bottom: 4px; font-weight: 600; }
+        .input-bar { display: flex; gap: 8px; align-items: center; }
+        .input-bar input { flex: 1; padding: 10px 14px; border-radius: 20px; border: 1px solid #243352; background: #090d16; color: #f8fafc; font-size: 0.88rem; outline: none; }
+        .input-bar button { background: #dc2626; color: white; border: none; width: 40px; height: 40px; border-radius: 50%; cursor: pointer; display: flex; align-items: center; justify-content: center; flex-shrink: 0; }
+        .modal { display: none; position: fixed; z-index: 100; left: 0; top: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.85); justify-content: center; align-items: center; }
+        .modal-card { background: #1e293b; border: 1px solid #38bdf8; border-radius: 16px; padding: 20px; width: 90%; max-width: 340px; }
+        .modal-card h3 { color: #38bdf8; font-size: 1rem; margin-bottom: 8px; }
+        .modal-card input { width: 100%; padding: 8px 12px; margin: 10px 0; border-radius: 8px; border: 1px solid #334155; background: #0f172a; color: white; }
+        .modal-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 10px; }
+        .btn-save { background: #0284c7; color: white; border: none; padding: 6px 14px; border-radius: 6px; font-weight: bold; cursor: pointer; }
+        .btn-cancel { background: #475569; color: white; border: none; padding: 6px 14px; border-radius: 6px; font-weight: bold; cursor: pointer; }
+    </style>
+</head>
+<body>
+<div class="app-card">
+    <div class="header">
+        <h2>🚨 ศูนย์สื่อสารฉุกเฉิน (Node A)</h2>
+        <div class="loc-badge" onclick="openLocModal()">📍 พิกัด: <span id="locDisplay">กำลังโหลด...</span> ✏️</div>
+    </div>
+    <div class="status-bar">
+        <div class="status-item"><span>🔋 แบตเสา A:</span><span class="status-value" id="batVal">--%</span></div>
+        <div class="status-item"><span>📶 สัญญาณล่าสุด:</span><span class="status-value" id="rssiVal">-- dBm</span></div>
+        <div class="node-list">
+            <span>📡 เสาที่ตรวจพบ:</span>
+            <div id="nodesContainer">
+                <span class="node-tag node-offline" id="tagNodeB">Node B (ทวน)</span>
+                <span class="node-tag node-offline" id="tagNodeC">Node C (ศูนย์)</span>
+            </div>
+        </div>
+    </div>
+    <div class="user-bar">
+        <label>
+            <span>ชื่อผู้ขอความช่วยเหลือ (<span id="uidDisplay">ID: --</span>)</span>
+            <button class="btn-reboot" onclick="rebootNodeA()">🔄 รีสตาร์ท Node A</button>
+        </label>
+        <input type="text" id="username" placeholder="เช่น สมชาย ใจดี (ห้อง 302)" maxlength="25" onchange="saveUsername(this.value)">
+    </div>
+    <div class="chat-box" id="chat"><div class="system-info">เชื่อมต่อกับเครือข่ายวิทยุฉุกเฉินแล้ว</div></div>
+    <div class="input-bar-container">
+        <div class="char-counter" id="counterBox"><span id="byteNum">0</span>/120 Bytes</div>
+        <div class="input-bar">
+            <input type="text" id="msg" placeholder="พิมพ์ข้อความฉุกเฉิน..." oninput="checkByteLimit(this)">
+            <button onclick="sendMsg()">
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="22" y1="2" x2="11" y2="13"></line><polygon points="22 2 15 22 11 13 2 9 22 2"></polygon></svg>
+            </button>
+        </div>
+    </div>
+</div>
+
+<div class="modal" id="locModal">
+    <div class="modal-card">
+        <h3>📍 แก้ไขพิกัดสถานที่เสา Node A</h3>
+        <p style="font-size:0.75rem; color:#94a3b8; margin-top:4px;">ใส่ค่า ละติจูด,ลองจิจูด ใหม่เพื่ออัปเดตตำแหน่งเสา</p>
+        <input type="text" id="newLocInput" placeholder="เช่น 7.0081,100.4742">
+        <div class="modal-actions">
+            <button class="btn-cancel" onclick="closeLocModal()">ยกเลิก</button>
+            <button class="btn-save" onclick="saveLocation()">บันทึกพิกัด</button>
+        </div>
+    </div>
+</div>
+
+<script>
+let myUID = localStorage.getItem('rescue_uid') || ('U' + Math.floor(1000 + Math.random() * 9000));
+localStorage.setItem('rescue_uid', myUID);
+document.getElementById('uidDisplay').innerText = myUID;
+
+let savedName = localStorage.getItem('rescue_uname');
+if (savedName) document.getElementById('username').value = savedName;
+
+function saveUsername(val) { localStorage.setItem('rescue_uname', val.trim()); }
+function getUtf8Bytes(str) { return new Blob([str]).size; }
+
+function checkByteLimit(el) {
+    let maxBytes = 120, str = el.value;
+    while (getUtf8Bytes(str) > maxBytes) str = str.slice(0, -1);
+    el.value = str;
+    let bLen = getUtf8Bytes(str);
+    document.getElementById('byteNum').innerText = bLen;
+}
+
+function openLocModal() {
+    document.getElementById('newLocInput').value = document.getElementById('locDisplay').innerText;
+    document.getElementById('locModal').style.display = 'flex';
+}
+function closeLocModal() { document.getElementById('locModal').style.display = 'none'; }
+
+function saveLocation() {
+    let newLoc = document.getElementById('newLocInput').value.trim();
+    if(!newLoc) return;
+    fetch('/api/set_location?loc=' + encodeURIComponent(newLoc)).then(r => r.text()).then(() => {
+        document.getElementById('locDisplay').innerText = newLoc;
+        closeLocModal();
+        alert('อัปเดตพิกัดเสา Node A เรียบร้อยแล้ว');
+    });
+}
+
+function rebootNodeA() {
+    if(confirm('คุณต้องการสั่งรีสตาร์ทบอร์ด Node A หรือไม่?')) {
+        fetch('/api/reboot').then(() => alert('กำลังรีสตาร์ท Node A...'));
+    }
+}
+
+function sendMsg() {
+    var u = document.getElementById('username').value.trim();
+    var m = document.getElementById('msg').value.trim();
+    if(!u) { alert('กรุณากรอกชื่อผู้ขอความช่วยเหลือ'); return; }
+    if(!m) return;
+    saveUsername(u);
+
+    fetch('/send?uid=' + myUID + '&user=' + encodeURIComponent(u) + '&text=' + encodeURIComponent(m))
+    .then(r => r.json()).then(res => {
+        var chat = document.getElementById('chat');
+        chat.innerHTML += `<div class="msg msg-user" id="msgbox_${res.msgId}">
+            <div class="msg-sender">${escapeHtml(u)}</div>
+            <div>${escapeHtml(m)}</div>
+            <div class="msg-footer">
+                <span></span>
+                <span class="msg-status-tag st-sent" id="st_${res.msgId}">⏳ กำลังส่ง...</span>
+            </div>
+        </div>`;
+        document.getElementById('msg').value = '';
+        checkByteLimit(document.getElementById('msg'));
+        chat.scrollTop = chat.scrollHeight;
+    });
+}
+
+function escapeHtml(text) { return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;"); }
+
+setInterval(function() {
+    let ts = Math.floor(Date.now() / 1000);
+    fetch('/get?uid=' + myUID + '&ts=' + ts).then(r => r.json()).then(data => {
+        if(data.replies && data.replies.length > 0) {
+            var chat = document.getElementById('chat');
+            data.replies.forEach(m => {
+                chat.innerHTML += `<div class="msg msg-officer">
+                    <div class="msg-sender" style="color:#ef4444;">${escapeHtml(m.officer)} (เจ้าหน้าที่)</div>
+                    <div>${escapeHtml(m.text)}</div>
+                </div>`;
+            });
+            chat.scrollTop = chat.scrollHeight;
+        }
+        if(data.statuses && data.statuses.length > 0) {
+            data.statuses.forEach(s => {
+                let tag = document.getElementById('st_' + s.msgId);
+                if(tag) {
+                    if(s.status === 'DELIVERED') { tag.className = 'msg-status-tag st-delivered'; tag.innerText = '✔✔ ถึงศูนย์แล้ว'; }
+                    else if(s.status === 'CLAIMED') { tag.className = 'msg-status-tag st-claimed'; tag.innerText = '🟡 รับเรื่องแล้ว (' + escapeHtml(s.officer) + ')'; }
+                    else if(s.status === 'RESOLVED') { tag.className = 'msg-status-tag st-resolved'; tag.innerText = '🟢 ปลอดภัยแล้ว'; }
+                }
+            });
+        }
+    });
+}, 1500);
+
+setInterval(function() {
+    let ts = Math.floor(Date.now() / 1000);
+    fetch('/status?ts=' + ts).then(r => r.json()).then(data => {
+        document.getElementById('batVal').innerText = data.bat_pct + '% (' + data.bat_v + 'V)';
+        document.getElementById('rssiVal').innerText = data.rssi + ' dBm';
+        document.getElementById('locDisplay').innerText = data.loc;
+        var bTag = document.getElementById('tagNodeB');
+        bTag.className = data.node_b ? 'node-tag node-online' : 'node-tag node-offline';
+        bTag.innerText = data.node_b ? 'Node B (' + data.rssi_b + 'dBm)' : 'Node B (Offline)';
+        var cTag = document.getElementById('tagNodeC');
+        cTag.className = data.node_c ? 'node-tag node-online' : 'node-tag node-offline';
+        cTag.innerText = data.node_c ? 'Node C (' + data.rssi_c + 'dBm)' : 'Node C (Offline)';
+    });
+}, 3000);
+</script>
+</body>
+</html>
+)rawliteral";
+
+void handleCaptiveRedirect(AsyncWebServerRequest *request) {
+  request->redirect("http://192.168.4.1/");
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+
+  setenv("TZ", "ICT-7", 1);
+  tzset();
+
+  setupWatchdog();
+  loadNodeConfig();
+
+  Serial.println("\n--- STARTING NODE A (VICTIM AP NODE) ---");
+
+  pinMode(BAT_ADC_PIN, INPUT);
+  initOLED();
+  delay(300);
+
+  WiFi.mode(WIFI_AP);
+  WiFi.softAPConfig(IPAddress(192, 168, 4, 1), IPAddress(192, 168, 4, 1), IPAddress(255, 255, 255, 0));
+  WiFi.softAP("Emergency_Help_NodeA", "12345678", 1, 0, 8);
+  WiFi.setTxPower(WIFI_POWER_13dBm);
+
+  dnsServer.start(DNS_PORT, "*", WiFi.softAPIP());
+  delay(200);
+
+  SPI.begin(SCK, MISO, MOSI, SS);
+  LoRa.setPins(SS, RST, DIO0);
+  while (!LoRa.begin(BAND)) {
+    Serial.println("LoRa Init Failed! Retrying...");
+    delay(1000);
+    yield();
+  }
+
+  configureLoRaRadio();
+
+  server.on("/", HTTP_GET, [](AsyncWebServerRequest *request){
+    request->send(200, "text/html; charset=utf-8", index_html);
+  });
+
+  server.on("/generate_204", HTTP_GET, handleCaptiveRedirect);
+  server.on("/redirect", HTTP_GET, handleCaptiveRedirect);
+  server.on("/hotspot-detect.html", HTTP_GET, handleCaptiveRedirect);
+  server.on("/canonical.html", HTTP_GET, handleCaptiveRedirect);
+  server.on("/connecttest.txt", HTTP_GET, handleCaptiveRedirect);
+
+  server.on("/api/reboot", HTTP_GET, [](AsyncWebServerRequest *request){
+    request->send(200, "text/plain", "REBOOTING");
+    delay(500);
+    performReboot();
+  });
+
+  server.on("/api/set_location", HTTP_GET, [](AsyncWebServerRequest *request){
+    if (request->hasParam("loc")) {
+      saveLocationConfig(request->getParam("loc")->value());
+    }
+    request->send(200, "text/plain", "OK");
+  });
+
+  server.on("/send", HTTP_GET, [](AsyncWebServerRequest *request){
+    String uid = request->getParam("uid")->value();
+    String user = request->getParam("user")->value();
+    String text = request->getParam("text")->value();
+    if (text.length() > 120) text = text.substring(0, 120);
+    if (user.length() > 40) user = user.substring(0, 40);
+
+    msgCounter++;
+    saveMsgCounterConfig();
+
+    String msgId = "A" + String(msgCounter);
+    
+    String userB64 = encodeBase64(user);
+    String textB64 = encodeBase64(text);
+
+    String packetPayload = msgId + "|3|A|C|MSG|" + uid + "|" + userB64 + "|" + currentLocationA + "|" + textB64;
+    
+    {
+      std::lock_guard<std::mutex> lock(retryMutex);
+      pendingRetryMsgs.push_back({msgId, packetPayload, 4, millis()});
+    }
+
+    {
+      std::lock_guard<std::mutex> lock(txMutex);
+      txQueue.push(packetPayload);
+    }
+
+    String resp = "{\"status\":\"OK\",\"msgId\":\"" + msgId + "\"}";
+    request->send(200, "application/json; charset=utf-8", resp);
+  });
+
+  server.on("/get", HTTP_GET, [](AsyncWebServerRequest *request){
+    if (request->hasParam("ts")) syncTimeFromEpoch(request->getParam("ts")->value().toInt());
+    if (!request->hasParam("uid")) {
+      request->send(200, "application/json; charset=utf-8", "{\"replies\":[],\"statuses\":[]}");
+      return;
+    }
+    String reqUid = request->getParam("uid")->value();
+    reqUid.trim();
+
+    String json = "{\"replies\":[";
+    {
+      std::lock_guard<std::mutex> lock(dataMutex);
+      bool first = true;
+      auto it = pendingReplies.begin();
+      while (it != pendingReplies.end()) {
+        if (it->targetUid == reqUid) {
+          if (!first) json += ",";
+          json += "{\"officer\":\"" + it->officer + "\",\"text\":\"" + it->text + "\"}";
+          first = false;
+          it = pendingReplies.erase(it);
+        } else ++it;
+      }
+      json += "],\"statuses\":[";
+      first = true;
+      auto itS = pendingStatusUpdates.begin();
+      while (itS != pendingStatusUpdates.end()) {
+        if (!first) json += ",";
+        json += "{\"msgId\":\"" + itS->msgId + "\",\"status\":\"" + itS->status + "\",\"officer\":\"" + itS->officer + "\"}";
+        first = false;
+        itS = pendingStatusUpdates.erase(itS);
+      }
+    }
+    json += "]}";
+    request->send(200, "application/json; charset=utf-8", json);
+  });
+
+  server.on("/status", HTTP_GET, [](AsyncWebServerRequest *request){
+    if (request->hasParam("ts")) syncTimeFromEpoch(request->getParam("ts")->value().toInt());
+    float volts = getAccurateBatteryVoltage();
+    int batPct = calculateBatteryPercentage(volts);
+    unsigned long now = millis();
+    bool activeB = (now - nodeB.lastSeen < 60000) && nodeB.active;
+    bool activeC = (now - nodeC.lastSeen < 60000) && nodeC.active;
+
+    String json = "{";
+    json += "\"bat_pct\":" + String(batPct) + ",";
+    json += "\"bat_v\":\"" + String(volts, 2) + "\",";
+    json += "\"rssi\":" + String(lastRssi) + ",";
+    json += "\"loc\":\"" + currentLocationA + "\",";
+    json += "\"node_b\":" + String(activeB ? "true" : "false") + ",";
+    json += "\"rssi_b\":" + String(nodeB.rssi) + ",";
+    json += "\"node_c\":" + String(activeC ? "true" : "false") + ",";
+    json += "\"rssi_c\":" + String(nodeC.rssi);
+    json += "}";
+    request->send(200, "application/json", json);
+  });
+
+  server.onNotFound(handleCaptiveRedirect);
+  server.begin();
+}
+
+void loop() {
+  esp_task_wdt_reset();
+  dnsServer.processNextRequest();
+
+  if (millis() - lastOledSwitch > 20000) {
+    lastOledSwitch = millis();
+    oledPage = (oledPage + 1) % 2;
+  }
+  
+  if (millis() - lastOledRender > 1000) {
+    lastOledRender = millis();
+    updateOLED();
+  }
+
+  // ส่ง LoRa ผ่าน Queue
+  String packetToSend = "";
+  {
+    std::lock_guard<std::mutex> lock(txMutex);
+    if (!txQueue.empty()) {
+      packetToSend = txQueue.front();
+      txQueue.pop();
+    }
+  }
+  if (packetToSend.length() > 0) {
+    sendLoRaRaw(packetToSend);
+    delay(40);
+  }
+
+  // ระบบ Auto-Retry (ARQ)
+  {
+    std::lock_guard<std::mutex> lock(retryMutex);
+    for (auto it = pendingRetryMsgs.begin(); it != pendingRetryMsgs.end(); ) {
+      if (millis() - it->lastSentTime > 3000) {
+        if (it->retriesLeft > 0) {
+          {
+            std::lock_guard<std::mutex> qLock(txMutex);
+            txQueue.push(it->fullPacket);
+          }
+          it->retriesLeft--;
+          it->lastSentTime = millis();
+          ++it;
+        } else {
+          it = pendingRetryMsgs.erase(it);
+        }
+      } else {
+        ++it;
+      }
+    }
+  }
+
+  // Heartbeat Node A (แนบ Timestamp ส่งออกไปทาง LoRa)
+  if (millis() - lastHeartbeatTime > heartbeatInterval) {
+    lastHeartbeatTime = millis();
+    heartbeatInterval = 35000 + random(0, 5000); 
+    float v = getAccurateBatteryVoltage();
+    int pct = calculateBatteryPercentage(v);
+    hbCounterA++;
+    
+    uint32_t freeHeap = ESP.getFreeHeap();
+    uint32_t uptimeSec = millis() / 1000;
+    int wifiClients = WiFi.softAPgetStationNum();
+    unsigned long currentEpoch = (unsigned long)time(NULL);
+
+    String hbPacket = "HBA" + String(hbCounterA) + "|3|A|ALL|HB|VictimNode|" + currentLocationA + "|" + String(pct) + "|" + String(v, 2) + "|" + String(freeHeap) + "|" + String(uptimeSec) + "|" + String(wifiClients) + "|" + String(currentEpoch);
+    {
+      std::lock_guard<std::mutex> lock(txMutex);
+      txQueue.push(hbPacket);
+    }
+  }
+
+  int packetSize = LoRa.parsePacket();
+  if (packetSize) {
+    String rawIncoming = "";
+    while (LoRa.available()) rawIncoming += (char)LoRa.read();
+    rawIncoming.trim();
+    lastRssi = LoRa.packetRssi();
+    lastSnr = LoRa.packetSnr();
+
+    int pLast = rawIncoming.lastIndexOf('|');
+    if (pLast == -1) return;
+    String payload = rawIncoming.substring(0, pLast);
+    uint16_t rxCrc = (uint16_t)strtol(rawIncoming.substring(pLast + 1).c_str(), NULL, 16);
+    if (calculateCRC16(payload) != rxCrc) return;
+
+    std::vector<String> tokens = splitString(payload, '|');
+    if (tokens.size() < 5) return;
+
+    String senderNode = tokens[2];
+    String targetNode = tokens[3];
+    String msgType = tokens[4];
+
+    if (senderNode == "B") {
+      nodeB.rssi = lastRssi;
+      nodeB.snr = lastSnr;
+      nodeB.lastSeen = millis();
+      nodeB.active = true;
+    } else if (senderNode == "C") {
+      nodeC.rssi = lastRssi;
+      nodeC.snr = lastSnr;
+      nodeC.lastSeen = millis();
+      nodeC.active = true;
+    }
+
+    if (targetNode != "A" && targetNode != "ALL") return;
+
+    // ACK ยืนยันการส่งข้อความ
+    if (msgType == "ACK" && tokens.size() >= 8) {
+      String targetMsgId = tokens[5]; 
+      String uid = tokens[6];
+      String status = tokens[7];
+      String officer = (tokens.size() >= 9) ? decodeBase64(tokens[8]) : "HQ";
+
+      {
+        std::lock_guard<std::mutex> lock(retryMutex);
+        for (auto it = pendingRetryMsgs.begin(); it != pendingRetryMsgs.end(); ) {
+          if (it->msgId == targetMsgId) it = pendingRetryMsgs.erase(it);
+          else ++it;
+        }
+      }
+
+      std::lock_guard<std::mutex> lock(dataMutex);
+      pendingStatusUpdates.push_back({targetMsgId, status, officer});
+    }
+    
+    // REPLY ข้อความตอบกลับ
+    if (msgType == "REPLY" && tokens.size() >= 9) {
+      String replyMsgId = tokens[0];
+      if (isDuplicate(replyMsgId)) return;
+
+      String targetUid = tokens[5];
+      String officer = decodeBase64(tokens[6]);
+      String text = decodeBase64(tokens[8]);
+
+      std::lock_guard<std::mutex> lock(dataMutex);
+      pendingReplies.push_back({targetUid, officer, text});
+    }
+
+    // คำสั่งรีสตาร์ท
+    if (msgType == "CMD" && tokens.size() >= 6) {
+      if (tokens[5] == "REBOOT") performReboot();
+    }
+  }
+}
