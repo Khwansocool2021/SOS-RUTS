@@ -1,5 +1,3 @@
-Node A
-
 #include <Arduino.h>
 #include <WiFi.h>
 #include <SPI.h>
@@ -214,28 +212,34 @@ void sendLoRaRaw(const String &packet) {
   LoRa.endPacket();
 }
 
+// ==================== [แก้ไขจุดที่ 1: การวัดแรงดันแบตเตอรี่] ====================
 float getAccurateBatteryVoltage() {
-  uint32_t rawSum = 0;
-  for (int i = 0; i < 16; i++) {
-    rawSum += analogRead(BAT_ADC_PIN);
+  uint32_t mvSum = 0;
+  for (int i = 0; i < 20; i++) {
+    mvSum += analogReadMilliVolts(BAT_ADC_PIN); // อ่านมิลลิโวลต์ผ่าน eFuse Calibration ของ ESP32
     delayMicroseconds(100);
   }
-  float rawAvg = rawSum / 16.0;
-  float volts = (rawAvg / 4095.0) * 2.0 * 3.3 * 1.08;
+  float mvAvg = mvSum / 20.0;
+  // วงจรแบ่งแรงดัน (Resistor Divider 100k/100k) หาร 2 อยู่ จึงคูณ 2.0 กลับเป็นแรงดันแบตเตอรี่จริง
+  float volts = (mvAvg / 1000.0) * 2.0; 
+
   if (volts > 4.25) volts = 4.25;
   if (volts < 3.00) volts = 3.00;
   return volts;
 }
 
+// ==================== [แก้ไขจุดที่ 2: การคำนวณ % แบตเตอรี่] ====================
 int calculateBatteryPercentage(float volts) {
-  if (volts >= 4.15) return 100;
-  if (volts >= 4.00) return 90;
-  if (volts >= 3.85) return 75;
-  if (volts >= 3.75) return 50;
-  if (volts >= 3.65) return 30;
-  if (volts >= 3.50) return 15;
-  if (volts >= 3.30) return 5;
-  return 0;
+  if (volts >= 4.18) return 100;
+  if (volts <= 3.20) return 0;
+  
+  // คำนวณเปอร์เซ็นต์ต่อเนื่องตาม Discharge Curve ของแบตเตอรี่ 18650
+  if (volts >= 4.05) return 90 + (int)((volts - 4.05) / (4.18 - 4.05) * 10);
+  if (volts >= 3.90) return 75 + (int)((volts - 3.90) / (4.05 - 3.90) * 15);
+  if (volts >= 3.80) return 50 + (int)((volts - 3.80) / (3.90 - 3.80) * 25);
+  if (volts >= 3.65) return 20 + (int)((volts - 3.65) / (3.80 - 3.65) * 30);
+  if (volts >= 3.35) return 5 + (int)((volts - 3.35) / (3.65 - 3.35) * 15);
+  return (int)((volts - 3.20) / (3.35 - 3.20) * 5);
 }
 
 void syncTimeFromEpoch(unsigned long epoch) {
